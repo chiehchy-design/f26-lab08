@@ -4,12 +4,14 @@ import edu.cmu.cs214.campusreserve.core.domain.Booking;
 import edu.cmu.cs214.campusreserve.core.domain.BookingOutcome;
 import edu.cmu.cs214.campusreserve.core.domain.BookingRequest;
 import edu.cmu.cs214.campusreserve.core.domain.CancellationResult;
+import edu.cmu.cs214.campusreserve.core.domain.ModificationResult;
 import edu.cmu.cs214.campusreserve.core.domain.RejectionReason;
 import edu.cmu.cs214.campusreserve.core.domain.Room;
 import edu.cmu.cs214.campusreserve.core.domain.TimeInterval;
 import edu.cmu.cs214.campusreserve.core.domain.WaitlistEntry;
 import edu.cmu.cs214.campusreserve.core.events.BookingCancelledEvent;
 import edu.cmu.cs214.campusreserve.core.events.BookingCreatedEvent;
+import edu.cmu.cs214.campusreserve.core.events.BookingModifiedEvent;
 import edu.cmu.cs214.campusreserve.core.events.DomainEvent;
 import edu.cmu.cs214.campusreserve.core.events.WaitlistPromotedEvent;
 import edu.cmu.cs214.campusreserve.core.policy.BookingPolicy;
@@ -30,7 +32,7 @@ import java.util.Objects;
 import java.util.Optional;
 
 /**
- * The booking flow: request a room, cancel a booking, and let the waitlist move
+ * The booking flow: request a room, modify or cancel a booking, and let the waitlist move
  * when time frees up.
  *
  * <p>This class is the only writer of waitlist entries in the platform. Anything
@@ -149,6 +151,73 @@ public final class BookingService {
 
         List<CancellationResult.Promotion> promotions = promoteWaitlist(cancelled.roomId());
         return new CancellationResult.Cancelled(cancelled, promotions);
+    }
+
+    /**
+     * Changes the interval, the attendee count, or both, on an upcoming booking
+     * its owner holds. The room stays the same.
+     *
+     * <p>The order is fixed: the booking has to exist and pass the same owner,
+     * still-held, and not-started checks a cancellation does. A request that
+     * asks for what the booking already is succeeds and records nothing. Then the
+     * new shape has to satisfy every booking rule, and the booker's own calendar
+     * and the room's calendar have to be free over the new interval, each
+     * ignoring the booking being modified. The cap on bookings held is not
+     * checked, because this booking already counts toward it.
+     *
+     * <p>A refusal changes nothing: nothing is stored, nobody joins the waitlist,
+     * and no event is published. A change to the interval runs the same waitlist
+     * promotion pass a cancellation does.
+     */
+    public ModificationResult modifyBooking(
+        String bookingId, String requesterId, TimeInterval newInterval, int newAttendees) {
+        Objects.requireNonNull(bookingId, "bookingId");
+        Objects.requireNonNull(requesterId, "requesterId");
+        Objects.requireNonNull(newInterval, "newInterval");
+
+        Optional<Booking> stored = bookings.findById(bookingId);
+        if (stored.isEmpty()) {
+            return ModificationResult.rejected(RejectionReason.BOOKING_NOT_FOUND);
+        }
+        Booking booking = stored.get();
+
+        Optional<RejectionReason> failure = rules.checkCancellable(booking, requesterId);
+        if (failure.isPresent()) {
+            return ModificationResult.rejected(failure.get());
+        }
+
+        if (booking.interval().equals(newInterval) && booking.attendees() == newAttendees) {
+            return new ModificationResult.Unchanged(booking);
+        }
+
+        Optional<Room> room = rooms.findById(booking.roomId());
+        if (room.isEmpty()) {
+            return ModificationResult.rejected(RejectionReason.ROOM_NOT_FOUND);
+        }
+        BookingRequest reshaped = BookingRequest.of(
+            booking.roomId(), booking.userId(), newInterval, newAttendees);
+        Optional<RejectionReason> ruleFailure = rules.checkRequest(reshaped, room.get());
+        if (ruleFailure.isPresent()) {
+            return ModificationResult.rejected(ruleFailure.get());
+        }
+
+        List<Booking> ownOthers = excluding(bookings.findActiveByUser(booking.userId()), bookingId);
+        if (conflictChecker.hasConflict(ownOthers, newInterval)) {
+            return ModificationResult.rejected(RejectionReason.USER_DOUBLE_BOOKED);
+        }
+        List<Booking> roomOthers = excluding(bookings.findActiveByRoom(booking.roomId()), bookingId);
+        if (conflictChecker.hasConflict(roomOthers, newInterval)) {
+            return ModificationResult.rejected(RejectionReason.ROOM_UNAVAILABLE);
+        }
+
+        Booking modified = booking.modified(newInterval, newAttendees, now());
+        bookings.save(modified);
+        publish(BookingModifiedEvent.of(booking, modified, now()));
+
+        List<CancellationResult.Promotion> promotions = booking.interval().equals(newInterval)
+            ? List.of()
+            : promoteWaitlist(booking.roomId());
+        return new ModificationResult.Modified(booking, modified, promotions);
     }
 
     /**
@@ -283,6 +352,11 @@ public final class BookingService {
     /** Does the user already hold a booking over this interval, in any room? */
     private boolean hasOwnOverlap(String userId, TimeInterval interval) {
         return conflictChecker.hasConflict(bookings.findActiveByUser(userId), interval);
+    }
+
+    /** The bookings in {@code held} other than the one with {@code bookingId}. */
+    private static List<Booking> excluding(List<Booking> held, String bookingId) {
+        return held.stream().filter(other -> !other.id().equals(bookingId)).toList();
     }
 
     /** Hands the event on. A failing subscriber must not undo a stored booking. */

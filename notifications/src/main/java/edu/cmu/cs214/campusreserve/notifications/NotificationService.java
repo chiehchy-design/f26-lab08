@@ -2,6 +2,7 @@ package edu.cmu.cs214.campusreserve.notifications;
 
 import edu.cmu.cs214.campusreserve.core.events.BookingCancelledEvent;
 import edu.cmu.cs214.campusreserve.core.events.BookingCreatedEvent;
+import edu.cmu.cs214.campusreserve.core.events.BookingModifiedEvent;
 import edu.cmu.cs214.campusreserve.core.events.DomainEvent;
 import edu.cmu.cs214.campusreserve.core.events.WaitlistPromotedEvent;
 import edu.cmu.cs214.campusreserve.core.ports.EventPublisher;
@@ -151,6 +152,14 @@ public final class NotificationService implements EventPublisher {
                 Placeholders.ROOM_ID, cancelled.roomId(),
                 Placeholders.WHEN, when,
                 Placeholders.BOOKING_ID, cancelled.bookingId());
+            case BookingModifiedEvent modified -> Map.of(
+                Placeholders.NAME, name,
+                Placeholders.ROOM_ID, modified.roomId(),
+                Placeholders.PREVIOUS_WHEN, IntervalText.formatUtc(modified.previousInterval()),
+                Placeholders.PREVIOUS_ATTENDEES, String.valueOf(modified.previousAttendees()),
+                Placeholders.WHEN, when,
+                Placeholders.ATTENDEES, String.valueOf(modified.attendees()),
+                Placeholders.BOOKING_ID, modified.bookingId());
             case WaitlistPromotedEvent promoted -> Map.of(
                 Placeholders.NAME, name,
                 Placeholders.ROOM_ID, promoted.roomId(),
