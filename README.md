@@ -90,3 +90,7 @@ python -m campusreserve_analytics revenue --events ../events.jsonl --format csv
 - Where your answers go: `PLAN.md`
 - Guardrail recipes: `guardrails/README.md`
 - CI: `.github/workflows/ci.yml`, which runs the same two commands as above.
+
+## Tools used
+
+Lab 8 was done with Claude Code (VS Code extension), model Claude Opus 5.5 (`claude-opus-5-5`), for implementation, and a fresh Claude Code subagent on the same model as the refuter.
