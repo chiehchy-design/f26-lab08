@@ -8,10 +8,32 @@ Baseline before planning: `mvn -B test` BUILD SUCCESS (418), `pytest` 137 passed
 
 Written before any task was run.
 
-**Design decisions**
-- **History** lives on the booking: `Booking.history()` is a `List<BookingChange>` (when, old interval/attendees, new interval/attendees). `GET /bookings/{id}` shows it, so there's no new endpoint.
-- **Errors:** no new `RejectionReason`. The modification reuses `NOT_BOOKING_OWNER`, `BOOKING_ALREADY_CANCELLED`/`STARTED`, the `BookingRules` reasons, `USER_DOUBLE_BOOKED`, and `ROOM_UNAVAILABLE`. A rejected modification never joins the waitlist.
-- **Event** `booking-modified`: the core fields hold the *new* values, plus `previousStart`/`previousEnd`/`previousAttendees`.
+**The request.** `CHANGE-REQUEST.md` asks for one feature: let people modify a booking they already hold, by changing the time or the number of attendees. Today they have to cancel and rebook. The feature reaches into most of the codebase:
+
+| What the feature needs | Where it lives |
+|---|---|
+| The rules: who can modify, conflict checks, waitlist | `core-domain` |
+| An email to the owner listing old and new details | `notifications` |
+| A `booking-modified` line in the event log | `storage` |
+| The utilization report counting the new length | `analytics` (Python) |
+| A `PATCH /bookings/{id}` endpoint | `http-api` |
+
+**The tasks at a glance**
+- **T1, the core logic** (`core-domain` + `notifications`). Adds `modifyBooking`:
+  - only the owner can modify, and only before the booking starts
+  - every booking rule is re-checked against the new time and attendee count
+  - a booking doesn't collide with itself
+  - waitlisted people get any freed time
+  - the owner gets an email
+- Notifications is bundled into T1 because the two modules are tied at compile time. The event types form a "sealed" list, and notifications has code that must handle every type on that list. Adding a new event without updating notifications stops that module compiling.
+- **T2, the log line** (`storage`). Writes `booking-modified` to the event log.
+- **T3, the report** (`analytics`). The Python report updates a modified booking's length instead of counting it twice.
+- **T4, the HTTP endpoint** (`http-api`). Adds `PATCH`, and `GET` shows the change history.
+
+**Decisions the change request leaves to us**
+- **History:** each booking keeps its own list of changes, each recording when it happened and the old and new values. `GET /bookings/{id}` shows it, so no new endpoint is needed.
+- **Errors:** no new error codes. A refused modification reuses the existing ones: not the owner, already cancelled or started, a broken booking rule, double-booked, or room taken. A refused modification never puts anyone on the waitlist.
+- **Event:** `booking-modified` carries the new time and attendee count, plus the previous ones.
 
 **T1. Modify a booking in the domain, with history and the owner's notification.** Modules: `core-domain`, `notifications`. Depends on: none.
 - `BookingService.modifyBooking` covers CR 1–6:
@@ -57,7 +79,11 @@ Written before any task was run.
   - GET shows the history
 - **Green but wrong:** copying `show`'s owner-or-admin check, which lets an admin modify anyone's booking.
 
-**Rules 3 and 4:** T1's checkpoint catches both, by diff grep:
+**Rules 3 and 4:**
+- Rule 3: `TimeInterval.overlaps` is the only code that decides whether two time ranges collide. No second overlap check anywhere.
+- Rule 4: only `BookingService` may add or remove waitlist entries.
+
+T1's checkpoint catches both, by diff grep:
 - `git diff -U0 -- '*.java' | grep -nE '(start|end)\(\)\.(isBefore|isAfter|compareTo)'` must print nothing outside `TimeInterval`.
 - `grep -rnE 'waitlist\.(save|remove)' --include='*.java' */src/main` must list only `BookingService`.
 
@@ -155,7 +181,7 @@ I was checking that the own-calendar check goes through `ConflictChecker` and no
 
 **Result:** 33 probes, all GREEN.
 
-**Strongest claim:** lengthening a booking can still promote someone, although CR 4 says lengthening "frees nothing". The setup:
+**Strongest claim:** the refuter found lengthening a booking can still promote someone, although CR 4 says lengthening "frees nothing". The setup:
 1. u-2 waits on r-1 11:00–12:00.
 2. When that slot frees, u-2 is skipped because of their own r-2 booking.
 3. u-2 then drops r-2, but that pass only checks the r-2 waitlist, so the r-1 entry is left waiting.
